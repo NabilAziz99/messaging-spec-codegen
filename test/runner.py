@@ -26,6 +26,7 @@ from cases.case_01_login import cases as cases_01_login  # noqa: E402
 from cases.case_02_send import cases as cases_02_send  # noqa: E402
 from cases.case_03_offline import cases as cases_03_offline  # noqa: E402
 from cases.case_04_outbox_queue import cases as cases_04_outbox_queue  # noqa: E402
+from cases.case_05_outbox_flush import cases as cases_05_outbox_flush  # noqa: E402
 
 
 def collect_cases():
@@ -35,6 +36,7 @@ def collect_cases():
         *cases_02_send(),
         *cases_03_offline(),
         *cases_04_outbox_queue(),
+        *cases_05_outbox_flush(),
     ]
 
 

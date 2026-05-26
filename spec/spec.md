@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-4 complete (through outbox queue).**
+This spec is built iteratively. **Iterations 1-5 complete (through outbox flush on auto-reconnect).**
 
 ---
 
@@ -145,6 +145,9 @@ again to claim a new identity.
 4. Send `{"type": "login", "name": <name>}`.
 5. Wait for `login_ok`.
 6. Transition INITIAL → LOGGED_IN. Print `logged in as <name>`.
+7. **Flush the outbox** (see "Outbox flush" below). A relaunched client
+   may find pending rows on disk from a prior session — they go out
+   as soon as we have a connection.
 
 **`/send <recipient> <text>` behavior (LOGGED_IN only):**
 
@@ -173,7 +176,7 @@ again to claim a new identity.
      - Try to connect. On failure, wait (exponential backoff: 1s,
        2s, 5s, capped at 10s) and retry. Retry indefinitely.
      - On TCP/WS connect success → send `{"type": "login", "name": <cached_name>}`.
-     - On `login_ok` → transition OFFLINE → LOGGED_IN. Print `reconnected`.
+     - On `login_ok` → transition OFFLINE → LOGGED_IN. Print `reconnected`. Flush the outbox (see "Outbox flush" below).
      - On `login_ok` failure or close 4000 during reconnect → transition to INITIAL (cached name lost). Print `disconnected: superseded by another session`.
 
 2. **On WebSocket close while LOGGED_IN, code == 4000** (superseded):
@@ -217,6 +220,35 @@ directory). JSON Lines: one object per line, UTF-8, LF newlines.
 - On `/send` while LOGGED_IN: **do NOT write to the outbox.** Live
   sends are not persisted (outbox holds offline-queued messages only).
 - The file is never truncated automatically.
+
+## Outbox flush (on every LOGGED_IN entry)
+
+The outbox flushes whenever the client transitions to LOGGED_IN —
+both fresh `/login` (covers the relaunched-process case) and
+auto-reconnect (covers the in-process recovery case). Same procedure
+either way:
+
+1. Read the outbox file (top to bottom, in file order).
+2. For each row with `status: "pending"`:
+   a. Send `{"type": "send", "id": id, "to": to, "text": text}`.
+   b. Wait for `send_ok` with matching `id`.
+   c. Update the row's `status` to `"sent"`.
+   d. Rewrite the file (atomic: write to `outbox-<name>.jsonl.tmp`,
+      then rename over the original).
+3. Skip rows that already have `status: "sent"`.
+
+**Mid-flush disconnect.** If the WebSocket dies before a `send_ok`
+arrives, the current row stays `pending`. The next reconnect retries
+it. (Iteration 8 will add UUID-based server dedup so retries are safe
+at-most-once.)
+
+**Recipient state during flush.** If the recipient is online, they
+receive `deliver` per §"Server behavior". If they're offline, the
+message is silently dropped (Iteration 6 will add the server inbox).
+
+**Stdout discipline.** Every status line is flushed immediately
+(line-buffered or explicit per-line flush). One status line per
+state change. No interactive prompt characters.
 
 ## Errors
 
@@ -347,3 +379,25 @@ expected stdout. All cases must pass for the current scope to be green.
 - Action (alice): `/send bob hi`
 - Expected: bob receives the message (per Step 2.a). `outbox-alice.jsonl`
   is empty / non-existent (live sends are NOT persisted in Iteration 4).
+
+### Step 5.a — flush delivers queued messages on auto-reconnect
+
+- Pre: alice LOGGED_IN, bob LOGGED_IN. Stop the server (alice and bob
+  both transition to OFFLINE and print `disconnected`).
+- Action (alice): `/send bob first`, `/send bob second` (both queue
+  to `outbox-alice.jsonl`).
+  Then restart the server (alice and bob auto-reconnect).
+- Expected stdout (alice): `disconnected`, `queued`, `queued`, `reconnected`.
+- Expected stdout (bob): `disconnected`, `reconnected`, then
+  `[alice → bob]  first` THEN `[alice → bob]  second` (in send order).
+- Expected disk state: `outbox-alice.jsonl` contains 2 rows, **both
+  `status: "sent"`**.
+
+### Step 5.b — flush with already-sent rows skips them
+
+- Pre: alice has an outbox with 1 row already `status: "sent"` (from a
+  prior session) and 0 pending rows. Server cycle (stop + restart)
+  triggers a fresh flush.
+- Action: stop server, restart server.
+- Expected: no new wire traffic for the already-`sent` row. File
+  unchanged.
