@@ -30,7 +30,9 @@ from protocol import (  # noqa: E402
     parse_frame,
 )
 from handlers import (  # noqa: E402
+    handle_deliver_ok,
     handle_login,
+    handle_send,
     on_disconnect,
 )
 
@@ -60,6 +62,14 @@ async def connection_handler(ws) -> None:
                     if user is not None:
                         raise ValueError("already logged in on this connection")
                     user = await handle_login(ws, frame)
+                elif frame_type == "send":
+                    if user is None:
+                        raise ValueError("send: not logged in")
+                    await handle_send(ws, frame, user)
+                elif frame_type == "deliver_ok":
+                    if user is None:
+                        raise ValueError("deliver_ok: not logged in")
+                    await handle_deliver_ok(frame, user)
                 else:
                     raise ValueError(f"unsupported frame: {frame_type!r}")
             except ValueError as e:

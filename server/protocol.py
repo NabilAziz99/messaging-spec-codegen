@@ -11,6 +11,9 @@ import re
 
 # Validation
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 # Server endpoint
 WS_PATH = "/ws"
@@ -23,7 +26,9 @@ CLOSE_INVALID_FRAME = 4001
 
 # Required key set per inbound frame type (exact match — extras are rejected).
 EXPECTED_KEYS = {
-    "login": {"type", "name"},
+    "login":      {"type", "name"},
+    "send":       {"type", "id", "to", "text"},
+    "deliver_ok": {"type", "id"},
 }
 
 

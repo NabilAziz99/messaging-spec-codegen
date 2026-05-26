@@ -23,12 +23,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framework import A, fail  # noqa: E402  (sys.path tweak required first)
 from cases.case_01_login import cases as cases_01_login  # noqa: E402
+from cases.case_02_send import cases as cases_02_send  # noqa: E402
 
 
 def collect_cases():
     """Concatenate every iteration's contribution in order."""
     return [
         *cases_01_login(),
+        *cases_02_send(),
     ]
 
 

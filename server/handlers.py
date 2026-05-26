@@ -6,10 +6,14 @@ directly. The dispatch glue lives in server.py.
 from __future__ import annotations
 
 import logging
+import time
+
+from websockets.exceptions import ConnectionClosed
 
 from protocol import (
     CLOSE_SUPERSEDED,
     NAME_PATTERN,
+    UUID_PATTERN,
     send_frame,
 )
 
@@ -43,6 +47,46 @@ async def handle_login(ws, frame: dict) -> str:
     await send_frame(ws, {"type": "login_ok", "name": name})
     logger.info("login ok: %r", name)
     return name
+
+
+async def handle_send(ws, frame: dict, sender: str) -> None:
+    """Validate, push to online recipient if any, ack."""
+    msg_id = frame["id"]
+    to = frame["to"]
+    text = frame["text"]
+
+    if not isinstance(msg_id, str) or not UUID_PATTERN.match(msg_id):
+        raise ValueError(f"send: invalid id {msg_id!r}")
+    if not isinstance(to, str) or not NAME_PATTERN.match(to):
+        raise ValueError(f"send: invalid recipient {to!r}")
+    if not isinstance(text, str):
+        raise ValueError("send: text must be a string")
+
+    msg = {
+        "id":        msg_id,
+        "from":      sender,
+        "to":        to,
+        "text":      text,
+        "server_ts": int(time.time()),
+    }
+
+    # If recipient is online, push the deliver frame. Iteration 6 will
+    # add the server inbox so offline recipients get the message on
+    # their next login.
+    recipient_ws = connections.get(to)
+    if recipient_ws is not None:
+        try:
+            await send_frame(recipient_ws, {"type": "deliver", **msg})
+        except ConnectionClosed:
+            logger.info("push to %r failed; message dropped (no inbox yet)", to)
+
+    await send_frame(ws, {"type": "send_ok", "id": msg_id})
+
+
+async def handle_deliver_ok(frame: dict, recipient: str) -> None:
+    """Currently a no-op. Iteration 6 will clear the recipient's inbox
+    entry by id."""
+    return
 
 
 def on_disconnect(name: str | None, ws) -> None:
