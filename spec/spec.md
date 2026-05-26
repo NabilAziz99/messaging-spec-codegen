@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-5 complete (through outbox flush on auto-reconnect).**
+This spec is built iteratively. **Iterations 1-6 complete (through server inbox).**
 
 ---
 
@@ -70,6 +70,9 @@ the moment it accepts the `send`.
 **In-memory state:**
 
 - `connections: dict[name, WebSocket]` — currently-connected users.
+- `inbox: dict[name, list[Message]]` — per-user pending messages
+  awaiting delivery. Each `Message` is the body of a `deliver` frame
+  (id, from, to, text, server_ts).
 
 **On `login` frame:**
 
@@ -79,9 +82,13 @@ the moment it accepts the `send`.
    with code 4000 reason `"superseded"`.
 3. Register: `connections[name] = ws`.
 4. Send `{"type": "login_ok", "name": name}` to the new connection.
+5. **Flush** `inbox[name]` — for each pending message, send a
+   `deliver` frame to the new connection in FIFO order. Messages
+   remain in the inbox until `deliver_ok` removes them.
 
 **On disconnect.** Remove `connections[name]` if it points to this
-socket.
+socket. The inbox is **not** touched (un-acked messages will be
+re-delivered on the next login).
 
 **On `send` frame:**
 
@@ -90,16 +97,18 @@ socket.
 2. Determine sender from the connection's registered user. If the
    connection isn't logged in, close with 4001.
 3. Set `server_ts = int(time.time())`.
-4. If `connections[to]` exists, push a `deliver` frame to that
-   connection immediately. (If the recipient is offline, the message
-   is silently dropped — Iteration 6 will add the server inbox.)
-5. Send `{"type": "send_ok", "id": id}` to the sender.
+4. **Append to `inbox[to]`** (creating the list if needed). This is
+   the canonical "we accepted the message" step.
+5. If `connections[to]` exists, **also** push a `deliver` frame to
+   that connection immediately. (The message still sits in the inbox
+   until `deliver_ok` removes it — at-least-once delivery.)
+6. Send `{"type": "send_ok", "id": id}` to the sender.
 
 **On `deliver_ok` frame:**
 
-No-op for now. The frame is part of the protocol so clients can
-acknowledge delivery, but with no inbox yet (Iteration 6) there's
-nothing to clean up.
+Find the matching `id` in the connection's owner's inbox and remove it.
+If the id isn't in the inbox (already removed, or never was), silently
+ignore.
 
 ## Client behavior
 
@@ -401,3 +410,25 @@ expected stdout. All cases must pass for the current scope to be green.
 - Action: stop server, restart server.
 - Expected: no new wire traffic for the already-`sent` row. File
   unchanged.
+
+### Step 6.a — server holds message for offline recipient
+
+- Pre: alice LOGGED_IN. bob has never logged in (or is OFFLINE).
+- Action (alice): `/send bob hi`
+- Expected: alice gets `send_ok`. Bob doesn't see the message yet.
+- Then: bob `/login bob`.
+- Expected stdout (bob): `logged in as bob`, then `[alice → bob]  hi`.
+
+### Step 6.b — multiple queued messages flushed in FIFO order on login
+
+- Pre: alice LOGGED_IN. bob offline. alice sends 3 messages to bob.
+- Action: bob `/login bob`.
+- Expected stdout (bob): three `[alice → bob]  …` lines in send order.
+
+### Step 6.c — deliver_ok clears the inbox (no re-delivery on reconnect)
+
+- Pre: alice sent 1 message to offline bob; bob logged in and saw it.
+- Action: cycle the server (stop, then restart). Bob's WS drops, bob
+  auto-reconnects and re-logs in.
+- Expected: bob does NOT receive the message again. (`deliver_ok` from
+  the first delivery removed it from the inbox.)

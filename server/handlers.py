@@ -25,6 +25,11 @@ logger = logging.getLogger("server")
 # Currently-connected users. Maps name → websocket.
 connections: dict[str, object] = {}
 
+# Per-user pending messages awaiting delivery. Each entry is the body
+# of a `deliver` frame: {id, from, to, text, server_ts}. Messages stay
+# in the inbox until a matching `deliver_ok` removes them.
+inbox: dict[str, list[dict]] = {}
+
 
 # ── Handlers ───────────────────────────────────────────────────────────
 
@@ -46,11 +51,20 @@ async def handle_login(ws, frame: dict) -> str:
     connections[name] = ws
     await send_frame(ws, {"type": "login_ok", "name": name})
     logger.info("login ok: %r", name)
+
+    # Flush pending inbox (FIFO). Messages stay in the inbox until
+    # deliver_ok removes them (at-least-once delivery).
+    pending = inbox.get(name, [])
+    for msg in list(pending):
+        await send_frame(ws, {"type": "deliver", **msg})
+    if pending:
+        logger.info("flushed %d pending to %r", len(pending), name)
+
     return name
 
 
 async def handle_send(ws, frame: dict, sender: str) -> None:
-    """Validate, push to online recipient if any, ack."""
+    """Validate, append to recipient inbox, optionally push, ack."""
     msg_id = frame["id"]
     to = frame["to"]
     text = frame["text"]
@@ -70,23 +84,31 @@ async def handle_send(ws, frame: dict, sender: str) -> None:
         "server_ts": int(time.time()),
     }
 
-    # If recipient is online, push the deliver frame. Iteration 6 will
-    # add the server inbox so offline recipients get the message on
-    # their next login.
+    # Append to recipient's inbox (canonical "accepted" step).
+    inbox.setdefault(to, []).append(msg)
+
+    # If recipient is online, also push immediately. Message stays in
+    # the inbox until deliver_ok removes it.
     recipient_ws = connections.get(to)
     if recipient_ws is not None:
         try:
             await send_frame(recipient_ws, {"type": "deliver", **msg})
         except ConnectionClosed:
-            logger.info("push to %r failed; message dropped (no inbox yet)", to)
+            logger.info("push to %r failed; message stays in inbox", to)
 
     await send_frame(ws, {"type": "send_ok", "id": msg_id})
 
 
 async def handle_deliver_ok(frame: dict, recipient: str) -> None:
-    """Currently a no-op. Iteration 6 will clear the recipient's inbox
-    entry by id."""
-    return
+    """Remove the matching id from recipient's inbox. Silently ignore
+    spurious / already-removed ids."""
+    msg_id = frame["id"]
+    if not isinstance(msg_id, str):
+        return
+    pending = inbox.get(recipient)
+    if not pending:
+        return
+    inbox[recipient] = [m for m in pending if m["id"] != msg_id]
 
 
 def on_disconnect(name: str | None, ws) -> None:
