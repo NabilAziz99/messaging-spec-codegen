@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-3 complete (login + online send + implicit offline state).**
+This spec is built iteratively. **Iterations 1-4 complete (through outbox queue).**
 
 ---
 
@@ -181,6 +181,43 @@ again to claim a new identity.
    - Print `disconnected: superseded by another session`.
    - **Do NOT auto-reconnect** (the name is no longer ours).
 
+**`/send <recipient> <text>` while OFFLINE (transparent queueing):**
+
+The user just types — the client routes based on current state. While
+OFFLINE:
+
+1. Validate as in the LOGGED_IN case (recipient regex; non-empty text).
+2. Generate a UUID v4 (`id`).
+3. Append one row to the outbox file (see "Outbox file" below):
+   `{"id": "...", "to": "...", "text": "...", "status": "pending"}`
+4. Print `queued`. Do NOT attempt to transmit (we're offline; the
+   reconnect loop will flush this row once it succeeds — Iteration 5).
+
+## Outbox file
+
+Each client keeps a **per-user outbox file** at
+`./outbox-<name>.jsonl` (relative to the client's current working
+directory). JSON Lines: one object per line, UTF-8, LF newlines.
+
+**Row schema (strict — exactly these four keys):**
+
+```jsonc
+{
+  "id":     "<UUID v4>",
+  "to":     "<recipient name>",
+  "text":   "<message text>",
+  "status": "pending"     // or "sent" once acked by the server
+}
+```
+
+**Lifecycle:**
+
+- On `/send` while OFFLINE (i.e., the WebSocket is currently down):
+  append a new row with `status: "pending"`. Lazy file creation.
+- On `/send` while LOGGED_IN: **do NOT write to the outbox.** Live
+  sends are not persisted (outbox holds offline-queued messages only).
+- The file is never truncated automatically.
+
 ## Errors
 
 | Trigger | Stdout (exact) |
@@ -287,3 +324,26 @@ expected stdout. All cases must pass for the current scope to be green.
   Alice transitions to INITIAL; **no subsequent `reconnected` line**
   appears even though the server is still up. This is the invariant
   unique to the new model — close-code 4000 stops auto-reconnect.
+
+### Step 4.a — outbox row created on first OFFLINE /send
+
+- Pre: alice OFFLINE.
+- Action: `/send bob hi bob`
+- Expected stdout: `queued`
+- Expected disk state: `outbox-alice.jsonl` exists in cwd, contains one row:
+  `{"id":"<uuid>","to":"bob","text":"hi bob","status":"pending"}` followed by `\n`.
+
+### Step 4.b — multiple OFFLINE sends append in order
+
+- Pre: alice OFFLINE.
+- Action: `/send bob first`, then `/send carol second`, then `/send bob third`.
+- Expected stdout: `queued` three times.
+- Expected disk state: `outbox-alice.jsonl` contains exactly three rows
+  in that order, each `status=pending`.
+
+### Step 4.c — online /send still does NOT write to outbox
+
+- Pre: alice LOGGED_IN, bob LOGGED_IN.
+- Action (alice): `/send bob hi`
+- Expected: bob receives the message (per Step 2.a). `outbox-alice.jsonl`
+  is empty / non-existent (live sends are NOT persisted in Iteration 4).
