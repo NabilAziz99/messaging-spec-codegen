@@ -29,6 +29,7 @@ from cases.case_04_outbox_queue import cases as cases_04_outbox_queue  # noqa: E
 from cases.case_05_outbox_flush import cases as cases_05_outbox_flush  # noqa: E402
 from cases.case_06_server_inbox import cases as cases_06_server_inbox  # noqa: E402
 from cases.case_07_reconnect import cases as cases_07_reconnect  # noqa: E402
+from cases.case_08_dedup import cases as cases_08_dedup  # noqa: E402
 
 
 def collect_cases():
@@ -41,6 +42,7 @@ def collect_cases():
         *cases_05_outbox_flush(),
         *cases_06_server_inbox(),
         *cases_07_reconnect(),
+        *cases_08_dedup(),
     ]
 
 

@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-7 complete (through the brief's full scenario).**
+This spec is built iteratively. **Iterations 1-8 complete (through UUID dedup).**
 
 ---
 
@@ -73,6 +73,9 @@ the moment it accepts the `send`.
 - `inbox: dict[name, list[Message]]` — per-user pending messages
   awaiting delivery. Each `Message` is the body of a `deliver` frame
   (id, from, to, text, server_ts).
+- `seen_ids: dict[name, set[id]]` — per-sender set of message ids the
+  server has already accepted. Used for dedup so retried `send` frames
+  don't double-deliver.
 
 **On `login` frame:**
 
@@ -96,13 +99,20 @@ re-delivered on the next login).
    `text` is a string.
 2. Determine sender from the connection's registered user. If the
    connection isn't logged in, close with 4001.
-3. Set `server_ts = int(time.time())`.
-4. **Append to `inbox[to]`** (creating the list if needed). This is
+3. **Dedup check.** If `id ∈ seen_ids[sender]`, this is a retry —
+   silently drop. Skip steps 4-6 but still send `send_ok {id}` so the
+   client can mark its outbox row as `sent`. **Dedup is on `(sender, id)`
+   alone:** if the same `(sender, id)` arrives twice with different
+   `to` or `text`, the second is still treated as a duplicate and
+   never stored. The first one's content is authoritative.
+4. Set `server_ts = int(time.time())`.
+5. **Append to `inbox[to]`** (creating the list if needed). This is
    the canonical "we accepted the message" step.
-5. If `connections[to]` exists, **also** push a `deliver` frame to
+6. Record `seen_ids[sender].add(id)`.
+7. If `connections[to]` exists, **also** push a `deliver` frame to
    that connection immediately. (The message still sits in the inbox
    until `deliver_ok` removes it — at-least-once delivery.)
-6. Send `{"type": "send_ok", "id": id}` to the sender.
+8. Send `{"type": "send_ok", "id": id}` to the sender.
 
 **On `deliver_ok` frame:**
 
@@ -472,3 +482,21 @@ Expected end state:
 - Server `inbox[alice]`: contains `"anything"` (un-delivered, awaits
   alice's next reconnect).
 - Server `inbox[bob]`: empty (delivered + acked).
+
+### Step 8.a — retry with same id deduplicates
+
+- Pre: alice and bob both LOGGED_IN.
+- Action: send TWO `send` frames over the wire with the same UUID
+  (e.g., via a raw WebSocket — simulates a client retry after a
+  disconnect that lost the original `send_ok`).
+- Expected: both sends receive `send_ok`. **Bob receives exactly ONE
+  `deliver` frame** (the first; the second is silently dropped).
+
+### Step 8.b — retry with same id but different content is still deduped
+
+- Pre: alice and bob both LOGGED_IN; carol is a third online user.
+- Action: send `{id=X, to=bob, text="first"}`, then
+  `{id=X, to=carol, text="different"}`. Dedup is on `(sender, id)`
+  alone — the second is treated as a duplicate.
+- Expected: bob receives "first". Carol receives nothing (the second
+  frame is dropped entirely). Both sends get `send_ok`.

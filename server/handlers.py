@@ -30,6 +30,11 @@ connections: dict[str, object] = {}
 # in the inbox until a matching `deliver_ok` removes them.
 inbox: dict[str, list[dict]] = {}
 
+# Per-sender set of message ids the server has already accepted. Used
+# to dedup retried `send` frames (Iteration 8). Dedup is on (sender, id)
+# alone — same id with different to/text is still a duplicate.
+seen_ids: dict[str, set[str]] = {}
+
 
 # ── Handlers ───────────────────────────────────────────────────────────
 
@@ -76,6 +81,15 @@ async def handle_send(ws, frame: dict, sender: str) -> None:
     if not isinstance(text, str):
         raise ValueError("send: text must be a string")
 
+    # Iteration 8: dedup on (sender, id). A duplicate still gets send_ok
+    # (so the client can mark its outbox row sent) but is NOT enqueued
+    # again — at-most-once delivery from any sender.
+    seen = seen_ids.setdefault(sender, set())
+    if msg_id in seen:
+        logger.info("dedup: %s from %r (already seen)", msg_id, sender)
+        await send_frame(ws, {"type": "send_ok", "id": msg_id})
+        return
+
     msg = {
         "id":        msg_id,
         "from":      sender,
@@ -86,6 +100,7 @@ async def handle_send(ws, frame: dict, sender: str) -> None:
 
     # Append to recipient's inbox (canonical "accepted" step).
     inbox.setdefault(to, []).append(msg)
+    seen.add(msg_id)
 
     # If recipient is online, also push immediately. Message stays in
     # the inbox until deliver_ok removes it.
