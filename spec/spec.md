@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-6 complete (through server inbox).**
+This spec is built iteratively. **Iterations 1-7 complete (through the brief's full scenario).**
 
 ---
 
@@ -432,3 +432,43 @@ expected stdout. All cases must pass for the current scope to be green.
   auto-reconnects and re-logs in.
 - Expected: bob does NOT receive the message again. (`deliver_ok` from
   the first delivery removed it from the inbox.)
+
+### Step 7 — the brief's full 7-step scenario (concurrent reconnect)
+
+The integration test. The brief's exact 7-step scenario must pass
+end-to-end against any conformant pair of clients. This is the
+strongest signal that the protocol is correct.
+
+Per-client network drops below are simulated by the test harness;
+the spec is mechanism-agnostic (closing the underlying socket and
+killing+relaunching the client process are both valid). What the
+client must do on disconnect and reconnect is fixed by the state
+machine and the outbox lifecycle.
+
+1. Alice → Bob: `"Hi Bob, I have something important to tell you"` (live)
+2. Bob → Alice: `"What is it?"` (live)
+3. Alice's network drops. She queues `/send bob "the something"`
+   (queues locally to `outbox-alice.jsonl`).
+4. Bob's network drops. He queues `/send alice "anything"` (queues
+   locally to `outbox-bob.jsonl`).
+5. Alice's network restores — she auto-reconnects and her outbox
+   flushes to the server. The server queues `"the something"` in
+   `inbox[bob]` since bob is still offline.
+6. Alice's network drops again (she never sees bob's eventual reply
+   in this run).
+7. Bob's network restores — he auto-reconnects. Concurrently:
+   - The server flushes `inbox[bob]` to bob's connection (he sees
+     `"the something"`).
+   - Bob's outbox flush sends `"anything"` to the server; the server
+     queues it in `inbox[alice]` since alice is now offline.
+
+Expected end state:
+- Bob's terminal: `[alice → bob]  Hi Bob, I have something important to tell you`,
+  `[alice → bob]  the something` (plus the live send/recv lines from steps 1-2).
+- Alice's terminal: `[bob → alice]  What is it?` (from step 2 only —
+  she's offline when bob's queued message gets delivered to the server).
+- Alice's outbox: 1 row, `status=sent` (`"the something"`).
+- Bob's outbox: 1 row, `status=sent` (`"anything"`).
+- Server `inbox[alice]`: contains `"anything"` (un-delivered, awaits
+  alice's next reconnect).
+- Server `inbox[bob]`: empty (delivered + acked).

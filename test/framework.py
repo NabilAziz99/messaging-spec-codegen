@@ -119,6 +119,25 @@ class ClientHandle:
             except asyncio.CancelledError:
                 pass
 
+    async def kill(self) -> None:
+        """SIGKILL the subprocess immediately, no graceful shutdown.
+
+        Used by the test harness to simulate "alice's machine drops off
+        the network" — the WebSocket dies abruptly from the server's
+        point of view, no `quit` frame, no clean close. The outbox file
+        in `self.cwd` persists; pair with `restart_client(prev=...)` to
+        relaunch a new process that reads it.
+        """
+        if self.proc.returncode is None:
+            self.proc.kill()
+            await self.proc.wait()
+        if self._reader is not None:
+            self._reader.cancel()
+            try:
+                await self._reader
+            except asyncio.CancelledError:
+                pass
+
 
 # ─── Server lifecycle ──────────────────────────────────────────────────
 
@@ -207,10 +226,17 @@ def _resolve_paths(argv: list[str]) -> list[str]:
     return out
 
 
-async def start_client(name: str, cmd: str) -> ClientHandle:
-    """Spawn a client subprocess in its own temp cwd."""
+async def start_client(name: str, cmd: str, cwd: Path | None = None) -> ClientHandle:
+    """Spawn a client subprocess.
+
+    If `cwd` is None, a fresh temp dir is created (the usual case). If a
+    `cwd` is passed in, the new client reuses it — this is how
+    `restart_client` simulates a relaunched client picking up its
+    persisted outbox file.
+    """
     argv = _resolve_paths(shlex.split(cmd))
-    cwd = Path(tempfile.mkdtemp(prefix=f"client-{name}-"))
+    if cwd is None:
+        cwd = Path(tempfile.mkdtemp(prefix=f"client-{name}-"))
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdin=subprocess.PIPE,
@@ -222,3 +248,18 @@ async def start_client(name: str, cmd: str) -> ClientHandle:
     h = ClientHandle(name=name, proc=proc, cwd=cwd)
     await h.start_reader()
     return h
+
+
+async def restart_client(prev: ClientHandle, cmd: str) -> ClientHandle:
+    """SIGKILL `prev` and spawn a fresh client with the same name + cwd.
+
+    Models "alice's machine dropped off the network and came back
+    later": the in-process OFFLINE state is gone, but the on-disk
+    outbox file in `prev.cwd` persists, so the new process picks up
+    where the killed one left off.
+
+    Returns a NEW ClientHandle — the caller should discard `prev`.
+    """
+    cwd = prev.cwd
+    await prev.kill()
+    return await start_client(prev.name, cmd, cwd=cwd)
