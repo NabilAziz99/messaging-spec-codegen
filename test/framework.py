@@ -94,6 +94,16 @@ class ClientHandle:
                 )
             await asyncio.sleep(0.05)
 
+    async def assert_not_seen(self, forbidden: str, window: float = 0.4) -> None:
+        """Assert that `forbidden` does NOT appear in any line received
+        during the next `window` seconds. Already-received lines (before
+        this call) are ignored — this is a forward-looking assertion."""
+        baseline = len(self.lines)
+        await asyncio.sleep(window)
+        for line in self.lines[baseline:]:
+            if forbidden in line:
+                raise AssertionError(f"{self.name}: saw forbidden {forbidden!r} in {line!r}")
+
     async def close(self) -> None:
         if self.proc.returncode is None:
             try:
@@ -126,24 +136,62 @@ async def _wait_for_server(host: str, port: int, timeout: float) -> None:
             await asyncio.sleep(0.1)
 
 
-@asynccontextmanager
-async def server_running() -> AsyncIterator[asyncio.subprocess.Process]:
-    """Context manager: server runs for the body, killed on exit."""
-    proc = await asyncio.create_subprocess_exec(
-        *SERVER_CMD, "--host", SERVER_HOST, "--port", str(SERVER_PORT),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
+class ServerHandle:
+    """Wraps the server subprocess; supports stop/start mid-test.
+
+    Iteration 3 introduces this so cases can simulate a network outage
+    by stopping the server and then bring it back. Tests that just
+    need "server up for the body" can use the `server_running` context
+    manager and ignore the handle.
+    """
+
+    def __init__(self) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        self._proc = await asyncio.create_subprocess_exec(
+            *SERVER_CMD, "--host", SERVER_HOST, "--port", str(SERVER_PORT),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         await _wait_for_server(SERVER_HOST, SERVER_PORT, SERVER_BOOT_TIMEOUT)
-        yield proc
+
+    async def stop(self) -> None:
+        if self._proc is None or self._proc.returncode is not None:
+            self._proc = None
+            return
+        self._proc.send_signal(signal.SIGINT)
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            self._proc.kill()
+            await self._proc.wait()
+        self._proc = None
+        # Give the OS a moment to release the listening socket so a
+        # subsequent .start() doesn't trip "address in use".
+        await asyncio.sleep(0.15)
+
+
+@asynccontextmanager
+async def server_running() -> AsyncIterator[ServerHandle]:
+    """Context manager: server is up for the body, cleanly stopped on exit.
+
+    Yields a `ServerHandle`. Most cases ignore it (`async with
+    server_running():`); cases that need to cycle the server mid-test
+    bind it (`async with server_running() as server:`) and call
+    `server.stop()` / `server.start()`.
+    """
+    server = ServerHandle()
+    await server.start()
+    try:
+        yield server
     finally:
-        if proc.returncode is None:
-            proc.send_signal(signal.SIGINT)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+        await server.stop()
 
 
 def _resolve_paths(argv: list[str]) -> list[str]:

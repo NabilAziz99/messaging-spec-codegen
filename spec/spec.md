@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-2 complete (login + online send).**
+This spec is built iteratively. **Iterations 1-3 complete (login + online send + implicit offline state).**
 
 ---
 
@@ -103,15 +103,39 @@ nothing to clean up.
 
 ## Client behavior
 
-**State machine.** Two states:
+**Design center: unreliable networks.** OFFLINE / online state is
+**not** driven by user commands — it's a reaction to the actual
+WebSocket connection. The user types and the client transparently
+decides whether to transmit on the wire or queue locally. This
+matches how real chat apps behave (the network dies; the user
+doesn't know; messages queue; the connection comes back; everything
+flushes).
+
+**State machine.** Three states, transitions driven by network events:
 
 ```
-                /login <name>
-   INITIAL ──────────────────► LOGGED_IN
+                /login <name>          ws closes (non-4000)
+   INITIAL ──────────────────► LOGGED_IN ──────────────────► OFFLINE
+       ▲                           ▲                            │
+       │                           │   reconnect + login_ok     │
+       │                           └────────────────────────────┘
+       │
+       │  ws closes with code 4000 (superseded — name cleared)
+       └─────────────────────────────────────────────────────────
 ```
 
 **Commands accepted in INITIAL:** `/login`, `/help`, `/quit`.
 **Commands accepted in LOGGED_IN:** `/send`, `/help`, `/quit`.
+**Commands accepted in OFFLINE:** `/send` (queues — Iter 4), `/help`, `/quit`.
+
+OFFLINE is **transient** — the client runs a reconnect loop in the
+background and re-enters LOGGED_IN as soon as the network is back.
+The cached `name` persists across OFFLINE.
+
+On WebSocket close code 4000 (superseded), the client goes back to
+**INITIAL** (the cached name is no longer ours — it belongs to whoever
+just logged in as us). No auto-reconnect; the user must `/login`
+again to claim a new identity.
 
 **`/login <name>` behavior:**
 
@@ -138,6 +162,24 @@ nothing to clean up.
 
 1. Print `[<from> → <to>]  <text>` (exact: two spaces between `]` and the text).
 2. Send `{"type": "deliver_ok", "id": <id>}` back to the server.
+
+**Network state transitions (implicit — driven by the WebSocket):**
+
+1. **On WebSocket close while LOGGED_IN, code != 4000** (server died,
+   network dropped, abnormal closure):
+   - Transition LOGGED_IN → OFFLINE.
+   - Print `disconnected` (one line, once per transition).
+   - Start the **reconnect loop** in the background:
+     - Try to connect. On failure, wait (exponential backoff: 1s,
+       2s, 5s, capped at 10s) and retry. Retry indefinitely.
+     - On TCP/WS connect success → send `{"type": "login", "name": <cached_name>}`.
+     - On `login_ok` → transition OFFLINE → LOGGED_IN. Print `reconnected`.
+     - On `login_ok` failure or close 4000 during reconnect → transition to INITIAL (cached name lost). Print `disconnected: superseded by another session`.
+
+2. **On WebSocket close while LOGGED_IN, code == 4000** (superseded):
+   - Transition LOGGED_IN → INITIAL. Clear cached name.
+   - Print `disconnected: superseded by another session`.
+   - **Do NOT auto-reconnect** (the name is no longer ours).
 
 ## Errors
 
@@ -216,3 +258,32 @@ expected stdout. All cases must pass for the current scope to be green.
 - Pre: client just started (INITIAL).
 - Action: `/send bob hi`
 - Expected stdout: `error: not logged in; use /login <name> first`
+
+### Step 3.a — server failure triggers OFFLINE automatically
+
+- Pre: alice LOGGED_IN.
+- Action: stop the server (kill its process).
+- Expected stdout (alice): `disconnected` (printed once, on transition).
+
+### Step 3.b — /send while OFFLINE queues (Iteration 4 will add the outbox)
+
+- Pre: alice OFFLINE (server stopped).
+- Action: `/send bob hi`
+- Expected stdout: `queued`
+
+### Step 3.c — server restoration auto-reconnects
+
+- Pre: alice OFFLINE (reconnect loop is running).
+- Action: restart the server.
+- Expected stdout (alice): `reconnected` (printed once, on transition back to LOGGED_IN).
+
+### Step 3.d — supersede after reconnect halts the reconnect loop
+
+- Pre: alice LOGGED_IN. Stop the server (alice goes OFFLINE, reconnect
+  loop running). Restart the server (alice auto-reconnects to LOGGED_IN
+  and prints `reconnected`).
+- Action: open a second client and type `/login alice` there.
+- Expected stdout (alice): `disconnected: superseded by another session`.
+  Alice transitions to INITIAL; **no subsequent `reconnected` line**
+  appears even though the server is still up. This is the invariant
+  unique to the new model — close-code 4000 stops auto-reconnect.
