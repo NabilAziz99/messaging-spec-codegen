@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-9 complete (through protocol error handling).**
+This spec is built iteratively. **All 10 iterations complete.**
 
 ---
 
@@ -580,3 +580,23 @@ Expected end state:
 
 - Action: send a frame whose UTF-8 body exceeds 16 KiB.
 - Expected: WS close code 4001, reason `oversize frame`.
+
+### Step 10.a — `/help` prints the command list
+
+- Pre: any state.
+- Action: type `/help`.
+- Expected stdout: the 4-line help block listing `/login`, `/send`,
+  `/help`, `/quit`. (No `/offline` or `/online` — disconnect and
+  reconnect are network-driven, not commands.)
+
+### Step 10.b — `--version` prints `messaging-client 1.0.0`
+
+- Action: run the client as `python clients/python/client.py --version`
+  (or `node clients/typescript/dist/client.js --version`).
+- Expected stdout: `messaging-client 1.0.0`. Process exits 0.
+
+### Step 10.c — unknown command prints help-pointing error
+
+- Pre: any state.
+- Action: type `/bogus` or any unknown verb.
+- Expected stdout: `error: unknown command — try /help`
