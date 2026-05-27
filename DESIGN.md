@@ -1,202 +1,221 @@
 # Design
 
-System-design decisions for the messaging app. Each section names a
-choice, the alternative we considered, and links to the corresponding
-trade-off in `FUTURE.md`.
+System-design decisions for the messaging app. Every section is a
+choice I made; Claude wrote the prose on my outlines.
 
-For behavior contracts see `spec/spec.md`. For run instructions see
-`README.md`.
+For behavior contracts see `spec/spec.md`. For run instructions and
+the explicit me-vs-Claude authorship boundary see `README.md`.
 
 ---
 
-## Transport: WebSocket
+## Transport: WebSocket, JSON frames
 
-A long-lived WebSocket per online client. The alternative was HTTP
-long-polling: simpler to write but adds latency on every push and
-forces the server to track pending GETs alongside its own state.
-WebSocket lets the server push `deliver` frames immediately with
-zero polling overhead.
-
-JSON-encoded frames — readable on the wire (useful for debugging),
-trivial to parse in both languages with stdlib alone, no schema
-compiler step.
+One long-lived WebSocket per online client. Server pushes `deliver`
+frames immediately with no polling. JSON on the wire — readable,
+stdlib-parseable in both languages, no schema compiler step.
 
 Trade-off: [Encryption](FUTURE.md#encryption) — wire is plaintext.
 
-## Implicit network state — no `/offline` / `/online` commands
+## Module structure
 
-The brief asks for a protocol that survives **unreliable networks**.
-The natural read of that is: offline / online isn't something the
-user decides — it's something the network does *to* them, and the
-client adapts transparently.
+**Server (3 modules)**, split by what kind of mutation they do:
 
-So the client has no `/offline` or `/online` command. Instead:
+- `server/protocol.py` — pure validation, no I/O, no state. Owns the
+  frame-shape check and the close-code constants.
+- `server/handlers.py` — module-level state (`connections`, `inbox`,
+  `seen_ids`) and per-frame handlers. State is mutated directly;
+  the single-threaded asyncio model means no locks.
+- `server/server.py` — WebSocket lifecycle only. Path check, frame
+  loop, dispatch by type, cleanup in `finally`. No state of its own.
 
-- **LOGGED_IN → OFFLINE** on WebSocket close (non-4000): the reader
-  loop notices the close, prints `disconnected`, and spawns a
-  background task that retries connect+login with backoff (1s, 2s,
-  5s, then 10s capped) indefinitely.
-- **OFFLINE → LOGGED_IN** when that loop's `login_ok` arrives: print
+**Client (4 modules, ~150-200 LoC each)** — pinned in the generator
+recipe:
+
+- `protocol` — wire format, frame types, help text, constants.
+- `outbox` — append-on-queue, read-on-flush, atomic rewrite. Knows
+  nothing about the WebSocket.
+- `connection` — the WebSocket. Owns the reader loop and the per-id
+  `send_ok` waiters. No state machine, no commands.
+- `client` — state machine, command dispatcher, background reconnect
+  loop, outbox flush. Glue.
+
+Why 4 modules and not 1: keeps each file diffable across
+regenerations. A single-file client makes LLM-local rewrites
+unpredictable — regenerating one part subtly shifts the rest. The
+recipe explicitly rejects single-file submissions.
+
+## Network-driven state machine
+
+Three client states: `INITIAL`, `LOGGED_IN`, `OFFLINE`. Transitions
+are driven by WebSocket events:
+
+- WS close with code ≠ 4000 (`LOGGED_IN` → `OFFLINE`): reader loop
+  catches it, prints `disconnected`, spawns a background task that
+  retries connect+login indefinitely with exponential backoff
+  (1s, 2s, 5s, then 10s capped).
+- `login_ok` from that loop (`OFFLINE` → `LOGGED_IN`): print
   `reconnected`, flush the outbox.
-- **LOGGED_IN → INITIAL** on close-code 4000 (supersede): name is
-  no longer ours, clear it, do NOT auto-reconnect.
+- WS close with code 4000, supersede (`LOGGED_IN` → `INITIAL`):
+  clear the cached name, do NOT auto-reconnect.
 
-The user just types. `/send` while LOGGED_IN goes live; `/send` while
-OFFLINE silently queues to disk. The reconnect loop handles the
-recovery.
+`/send` while `LOGGED_IN` goes live to the wire. `/send` while
+`OFFLINE` queues to disk and prints `queued`. The reconnect loop
+owns the recovery — the user issues no explicit reconnect command.
 
-The alternative we considered was explicit `/offline` and `/online`
-commands. It reads cleanly as a state machine but fights the brief's
-framing — a user typing `/offline` to "tell" their client the network
-died is backwards. The implicit model is also the only one that
-honestly handles `kill -9` of the client process: an explicit-command
-model assumes the client is alive enough to receive commands.
+Three implementation patterns the recipe pins because half-correct
+versions fail conformance silently:
 
-Trade-off: more complex client code (a background reconnect task,
-abort-token bookkeeping, dual flush trigger paths). Two bugs the
-implicit model invites — Python's `async for` exiting silently on
-graceful close, TypeScript's reconnect-loop "running" flag never
-clearing after success — are pinned in the generator recipes so
-regenerations don't reproduce them.
+1. **`connect_and_login` returns a 3-way result**
+   (`'ok' | 'unreachable' | 'superseded'`), not a bool. The user
+   `/login` path collapses both failure modes into one error string;
+   the reconnect loop distinguishes them — `'unreachable'` triggers
+   another backoff, `'superseded'` terminates the loop.
+2. **Reader-loop close-handler invariant.** The handler must fire on
+   *every* loop termination — silent `async for` exit, explicit
+   `ConnectionClosed`, anything else. Older `websockets` versions
+   exited silently on graceful close; the first implementation only
+   handled the exception branch and the client stayed `LOGGED_IN`
+   forever. Pinned in the Python recipe item #10.
+3. **Reconnect "running" flag must self-clear.** The TypeScript
+   reconnect loop's abort token is set on spawn and must be cleared
+   when the loop exits (via `.finally()`). Without that, a one-shot
+   successful reconnect leaves the flag set and the next disconnect
+   short-circuits with "already running". Pinned in the TS recipe
+   item #10.
 
-## At-least-once delivery via inbox + deliver_ok
+Outbox flush runs on **every** `LOGGED_IN` entry — both the
+auto-reconnect path and fresh `/login` after a process restart. The
+killed-and-relaunched recovery only works because of this.
 
-The server appends every accepted `send` to `inbox[recipient]` —
-that's the canonical "we accepted it" step. If the recipient is
-online, the server also pushes a `deliver` frame immediately. The
-message stays in the inbox until a matching `deliver_ok` arrives.
+Trade-off: more complex client code than a synchronous request/reply
+model would need.
 
-If a `deliver` is pushed but the client dies before acking, the
-message gets re-pushed on next login. Combined with the dedup
-policy below, this yields **at-most-once user-visible delivery with
-at-least-once wire delivery** — the right shape for a chat protocol
-that wants no message loss.
+## At-least-once delivery via inbox + `deliver_ok`
+
+Server appends every accepted `send` to `inbox[recipient]` — that's
+the canonical "we accepted it" step. If the recipient is online, the
+server also pushes a `deliver` immediately. Messages stay in the
+inbox until `deliver_ok` arrives.
+
+Yields at-most-once user-visible delivery with at-least-once wire
+delivery — the right shape for a chat protocol that wants no
+message loss.
 
 Trade-off: [Unbounded server inbox](FUTURE.md#unbounded-server-inbox).
 
-## Outbox = offline-queued only
+## Outbox: offline-queued only, atomic on update
 
-Only `/send` while OFFLINE writes a row to `outbox-<name>.jsonl`.
-Live sends (while LOGGED_IN) go straight to the wire — they're never
-persisted. The alternative was "persist every send for crash
-recovery," which inflates the file with messages the server has
-already accepted.
+JSON Lines, one row per line, UTF-8, explicit LF newlines. Path:
+`./outbox-<name>.jsonl`. Schema is strict — exactly four keys:
+`id`, `to`, `text`, `status` (`"pending"` or `"sent"`).
 
-Result: the outbox file grows with frequency of offline periods, not
-with total message volume.
+Append on `/send` while `OFFLINE`. Never written on `LOGGED_IN`
+sends — those go straight to the wire. Status flips
+`"pending"` → `"sent"` when the matching `send_ok` arrives.
+
+Status updates can't be partial-write-truncated: write the new file
+to `<path>.tmp`, then atomic-rename over the original (`os.replace`
+on Python, `renameSync` on Node — both atomic on POSIX and Windows).
+
+Result: outbox grows with offline periods, not with total message
+volume.
 
 Trade-off: [Mid-send-disconnect](FUTURE.md#mid-send-disconnect) —
-live sends that die mid-flight are lost.
+live sends that die mid-flight are lost (no in-memory pending set).
 
-## UUID dedup at the server
+## UUID dedup at the server — key is `(sender, id)`
 
-Every `send` carries a sender-generated UUID v4. The server tracks
-`seen_ids[sender]` and silently dedups retries — same `(sender, id)`
-arriving twice means the second is dropped (but still gets `send_ok`
-so the sender can mark its outbox row sent).
+Every `send` carries a sender-generated UUID v4. Server tracks
+`seen_ids[sender]` and silently drops retries. A duplicate still
+receives `send_ok` so the client can flip its outbox row to `"sent"`
+and stop retrying.
 
-This makes the outbox flush **idempotent**: the client can safely
-replay every `pending` row on reconnect without risking duplicate
-delivery. The retry policy on a flaky connection becomes trivial —
-just resend until the row is `status: sent`.
+**Key choice is `(sender, id)`, not `id` alone.** Two senders can in
+principle generate the same UUID; only the sender's namespace
+matters. The same `(sender, id)` with different `to` or `text` is
+still treated as a duplicate (first-write-wins) — defends against an
+adversarial client recycling an id to multiple recipients. Tested by
+Step 8.b.
+
+The dedup makes the outbox flush idempotent end-to-end. The client
+can safely replay every pending row on reconnect without risk of
+duplicate delivery.
 
 ## Strict frame validation
 
-Frames with unknown frame types, missing required fields, or extra
-top-level keys are rejected (WebSocket close code 4001). The
-alternative was "ignore unknown fields" — softer on forward compat
-but lets a malformed sender go undetected. Strict validation catches
-the bug at the boundary.
+`parse_frame` rejects on any wire-shape violation: non-parseable
+JSON, non-object body, unknown `type`, missing required fields,
+*and* extra top-level keys. Each violation maps to a deterministic
+close-reason string (`invalid json`, `invalid frame`, `oversize
+frame`, plus per-handler causes like `send: not logged in`). Frame
+size cap (16 KiB) is enforced before parsing.
 
-Trade-off: [Strict validation](FUTURE.md#strict-validation) — future
-protocol versions need explicit handshake to extend.
+Set-equality on the key set (not subset) is the key call: a frame
+with extras is rejected, not silently accepted with extras ignored.
+Tested by Steps 9.a–9.d.
+
+Trade-off: [Strict validation](FUTURE.md#strict-validation) —
+future protocol versions need an explicit handshake to extend the
+schema without breaking older peers.
 
 ## Single-threaded event loop, both sides
 
-Python `asyncio`, Node async/await. One event at a time — no shared
-mutable state to guard. The reconnect interleaving (server flushing
-its inbox while the client flushes its outbox, on the same socket)
-is simple to reason about because each side processes inbound and
-outbound serially within its loop.
-
-The alternative — multi-threaded handlers — buys nothing for a
-single-process server with O(connected users) state and adds locks
-the spec doesn't need.
+Python `asyncio`, Node async/await. One event at a time, no shared
+mutable state to guard, no locks. The reconnect interleaving (server
+flushing its inbox while the client flushes its outbox on the same
+socket) is simple to reason about because each side processes
+inbound and outbound serially within its loop.
 
 ## Auto-register on first login
 
-`/login alice` claims the name "alice" iff it's not already taken
-by another live connection. No signup step, no password. Defensible
-because the brief excludes security entirely.
+`/login alice` claims the name iff not currently in use. No signup,
+no password — the brief excludes security entirely.
 
 Trade-off: [Authentication](FUTURE.md#authentication).
 
 ## Single connection per name (supersede)
 
-If a second connection logs in with a name that's already connected,
-the server closes the first with close code 4000 reason `superseded`.
-The client receiving the 4000 transitions to INITIAL and prints
-`disconnected: superseded by another session`.
-
-The alternative was "reject the second login while the first is live"
-— but that locks out the legitimate user if their previous session
-died abnormally and the connection hasn't timed out yet. Supersede
-favors recovery over guarding.
+A second `/login alice` while the first connection is live closes
+the first with code 4000. Favors recovery over guarding — if the
+previous session died abnormally and the TCP connection hasn't
+timed out yet, the legitimate user is not locked out.
 
 Trade-off: [Multi-device per user](FUTURE.md#multi-device-per-user).
 
-## Test harness: subprocess + per-iteration case modules
-
-Clients are in different languages, so the harness drives both via
-stdin/stdout over subprocess — the only portable mechanism. Cases
-live in `test/cases/case_NN_*.py`, each module exposing a `cases()`
-function the runner concatenates in order.
-
-Each test boots its own server in a context manager (clean state per
-case), spawns clients in temp directories (outbox files don't collide),
-and asserts both stdout content and on-disk outbox state.
-
 ## Testing unreliable networks
 
-Each critical behavior of the implicit model gets a dedicated test,
-because a half-correct implementation would silently pass without one:
+Two harness primitives in `test/framework.py` drive every network
+scenario:
 
-- **WS-drop → OFFLINE** (Step 3.a) — `server.stop()` mid-test, then
-  `alice.wait_for("disconnected")`. Catches the bug where Python's
-  `async for raw in ws` exits silently on graceful close and the
-  client stays LOGGED_IN forever (we hit this and pinned it in the
-  generator recipe).
+- **`ServerHandle.stop()` / `.start()`** — bounce the server
+  mid-test. Stop sends SIGINT, waits up to 3s, falls back to
+  SIGKILL, then sleeps 150 ms so the OS releases the listen socket
+  before the next `.start()`. Every connected client's WS dies at
+  once — drives global outage.
+- **`ClientHandle.kill()` + `restart_client(prev, cmd)`** — SIGKILL
+  one client and respawn in the same cwd. On-disk outbox persists;
+  the relaunched client flushes it on the next `/login`. Drives
+  per-client outage with state recovery.
 
-- **Supersede halts the reconnect loop** (Step 3.d, *the correctness
-  gate*) — after a successful auto-reconnect, kick alice with a
-  second `/login alice` from a different client, then
-  `alice.assert_not_seen("reconnected", window=1.5)`. Without this
-  check you could ship a client with a retry timer still ticking
-  after 4000 — looks healthy but leaks work forever.
+Two assertion helpers carry weight:
 
-- **Outbox flush on every LOGGED_IN entry** — Step 5.a exercises the
-  auto-reconnect path (in-process recovery); Step 7 exercises the
-  fresh-`/login` path via `restart_client()`, proving a
-  killed-and-relaunched process recovers pending sends from disk.
-  Without the second test, the spec's "flush on every LOGGED_IN
-  entry" rule is half-verified.
+- `wait_for(expected, timeout)` advances a per-handle cursor past
+  each match — repeated `wait_for("queued")` calls find each NEW
+  occurrence, not the first one over and over.
+- `assert_not_seen(forbidden, window)` is **forward-looking** —
+  baseline = current line count, sleep, then scan only lines added
+  during the window. The right shape for "X must not appear in the
+  next N seconds." Powers the Step 3.d correctness gate.
 
-- **`deliver_ok` clears the server inbox** (Step 6.c) — bob receives,
-  server cycle, bob auto-reconnects; `bob.assert_not_seen(msg, 0.4)`.
-  Without this the server would re-deliver the message on every
-  reconnect.
+Five tests are the design's correctness gates:
 
-- **Brief's full 7-step scenario** (Step 7) — hybrid:
-  `server.stop()/.start()` for the global-outage phase, then
-  `ClientHandle.kill()` + `restart_client()` for the asymmetric
-  phase where alice and bob are independently offline. Asserts the
-  full final state on both clients' terminals, both outbox files,
-  and both server inboxes.
+| Behavior | Test | Mechanism |
+|---|---|---|
+| WS-drop → OFFLINE | Step 3.a | `server.stop()` + `wait_for("disconnected")` |
+| Supersede halts reconnect | Step 3.d | Kick alice from a second client + `assert_not_seen("reconnected", 1.5)` |
+| Outbox flush on every LOGGED_IN entry | Step 5.a + Step 7 | Step 5.a hits auto-reconnect path; Step 7 hits fresh-login path via `restart_client()` |
+| `deliver_ok` clears the inbox | Step 6.c | Server cycle after bob acks + `assert_not_seen(msg, 0.4)` |
+| Brief's 7-step scenario | Step 7 | Hybrid: server cycle for global phase + `kill()` + `restart_client()` for asymmetric phase |
 
-Two harness primitives unlock all of these: `ServerHandle.stop()/.start()`
-for global outages, and `ClientHandle.kill()` + `restart_client(prev,
-cmd)` for per-client outages with the on-disk outbox surviving. The
-rejected alternative for per-client drops was a server-side
-`/admin/kick` endpoint — the kill+restart path is stronger because
-it also exercises the "process died, came back later" recovery,
-which the in-process auto-reconnect path alone doesn't cover.
+Authorship per test file is documented in `README.md` § "Test files —
+authorship by file".
