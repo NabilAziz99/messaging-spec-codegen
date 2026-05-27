@@ -1,34 +1,76 @@
-# Messaging app
+# Spec-driven code generator
 
-Two CLI clients (Python and TypeScript) and a single server. Everything
-runs on localhost over WebSocket.
+A **spec-driven code generator for a messaging app**. The spec
+(`spec/spec.md`) is written generically — wire protocol + persistence +
+client state machine, no language-specific details — and the generator
+produces two client implementations from it: Python and TypeScript.
 
-## What it does
+**The generator is the deliverable.** It runs inside Claude Code as the
+`/regen-clients` slash command. Given `spec/spec.md`, it produces
+`clients/python/` and `clients/typescript/` — four modules per
+language, ~150–200 lines each — and runs a conformance test (32 cases)
+against both. Reproducibility is the primary criterion: deleting
+`clients/` and re-running the command must produce conformant clients
+again.
 
-- A user identifies themselves by name on first launch (`/login alice`).
+## Regenerate the clients (the headline workflow)
+
+```bash
+# In a clean run dir (the three siblings spec-codegen-iter-run1/2/3
+# are kept around as fresh checkpoints; pick one or strip clients/
+# in this dir):
+rm -rf clients/python clients/typescript
+
+# Open Claude Code and invoke the slash command:
+claude
+> /regen-clients
+```
+
+`/regen-clients` runs three phases:
+
+1. **Generate** — spawns `python-client-generator` and
+   `typescript-client-generator` in parallel. Each reads
+   `spec/spec.md` and writes its 4-module client into its own
+   workspace (the Python sub-agent has no access to the TypeScript
+   directory and vice versa).
+2. **Conformance** — spawns `conformance-checker`, which runs
+   `test/runner.py` against **both** generated clients (32 cases
+   each, Python and TypeScript). Both must PASS.
+3. **Report** — PASS or FAIL with the failing case if any.
+
+The generator never writes code in the orchestrator turn — every
+file is produced by a scope-restricted sub-agent. Three independent
+run dirs (`spec-codegen-iter-run1/2/3`, each a fresh clone with
+`clients/` stripped) let you check that independent rolls produce
+conformant clients.
+
+## The example: a localhost messaging app
+
+What the generated clients do:
+
+- A user identifies themselves by name on first launch
+  (`/login alice`).
 - They send text to another user (`/send bob hi`).
-- If the sender is offline (the WebSocket is down), the message queues
-  to a file on disk and flushes the next time the network is back.
-  Going offline is **not** a command — the client detects it from the
-  socket dying and auto-reconnects in the background with backoff.
-- If the recipient is offline, the server holds the message and pushes
-  it when they next log in.
-- Retries are safe — every message has a UUID, the server dedups, so
-  reconnect-and-replay doesn't double-deliver.
+- If the sender is offline (the WebSocket is down), the message
+  queues to a file on disk and flushes the next time the network is
+  back. Going offline is **not** a command — the client detects it
+  from the socket dying and auto-reconnects in the background with
+  backoff.
+- If the recipient is offline, the server holds the message and
+  pushes it when they next log in.
+- Retries are safe — every message has a UUID, the server dedups on
+  `(sender, id)`, so reconnect-and-replay doesn't double-deliver.
 
 Six JSON frame types over one WebSocket per online client. See
 `spec/spec.md` for the full contract.
 
-## Run it
+### Run the example
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Then open three terminals. The friendliest way to chat is through
-`chat.py`, which prompts you for your name and the recipient's name,
-auto-logs you in, prints a banner so it's obvious what to do, and
-lets you just type messages (no `/send <name>` for every line):
+Open three terminals:
 
 ```bash
 # Terminal 1 — server
@@ -48,10 +90,6 @@ Who do you want to chat with? alice
 `chat.py` also accepts both names as positional args if you'd rather
 skip the prompts: `python chat.py alice bob --ts`.
 
-Use `--py` (the default) or `--ts` to pick which generated client to
-wrap. You can mix-and-match — one peer on each language is the most
-interesting demo, since it proves cross-language interop end-to-end.
-
 You'll see a banner like:
 
 ```
@@ -68,11 +106,14 @@ alice → bob > [bob → alice]  loud and clear
 alice → bob >
 ```
 
-### Or use the spec-compliant CLI directly
+The most interesting demo is one peer on each language — proves
+cross-language interop end-to-end.
+
+#### Or drive the spec-compliant CLI directly
 
 `chat.py` is a thin rendering layer; the spec-compliant clients
-underneath speak `/send <recipient> <text>` for every message. If you
-want to drive them directly (this is what the test runner does):
+underneath speak `/send <recipient> <text>` for every message. If
+you want to drive them directly (this is what the test runner does):
 
 ```bash
 python clients/python/client.py
@@ -85,7 +126,7 @@ node clients/typescript/dist/client.js
 
 No banner — the raw clients implement only what the spec mandates.
 
-## Test it
+### Verify the generated clients
 
 ```bash
 python test/runner.py --client-cmd "python clients/python/client.py"
@@ -97,14 +138,6 @@ critical network gates (server-stop → OFFLINE, supersede halts
 reconnect, outbox flush on every LOGGED_IN entry, deliver_ok clears
 the inbox, brief's 7-step scenario) live in `DESIGN.md` § "Testing
 unreliable networks".
-
-## Regenerate the clients
-
-```bash
-rm -rf clients/python clients/typescript
-claude
-> /regen-clients
-```
 
 ## Layout — who wrote what
 
@@ -121,25 +154,6 @@ claude
 | `test/cases/case_01_login.py`, `case_02_send.py`, `case_04_outbox_queue.py`, `case_06_server_inbox.py`, `case_09_protocol_errors.py`, `case_10_polish.py` | mostly Claude | Mechanical cases against an already-clear spec. Claude wrote them; I reviewed for spec adherence. |
 | `chat.py` | Claude (fully AI-generated) | 2-party demo wrapper around a spec-compliant client. Auto-logs in, banner, plain-text → `/send` translation, `--py`/`--ts` flag. Not part of the regeneration contract. |
 | `clients/python/`, `clients/typescript/` | Claude (fully AI-generated) | Produced by `/regen-clients` from `spec/spec.md` + the recipes in `.claude/`. I do **not** hand-edit them. When a regen produces a buggy client, I update the spec or the recipe and regenerate — never the client directly. |
-
-## What the Claude prompts do
-
-The `.claude/` directory holds one slash command and three focused
-sub-agents. When you run `/regen-clients`, the orchestrator dispatches
-them in order:
-
-- **`python-client-generator`** — reads `spec/spec.md`, writes the
-  four Python client modules (`protocol`, `outbox`, `connection`,
-  `client`), pinned to ~150-200 lines each. Sanity-checks with
-  `--help` before returning.
-- **`typescript-client-generator`** — same for TypeScript. Compiles
-  to `dist/` with `tsc`.
-- **`conformance-checker`** — runs `test/runner.py` against the
-  freshly-generated clients and reports PASS or FAIL.
-
-The orchestrator never writes code itself — only delegates. Each
-sub-agent has a restricted tool list and scoped workspace (the
-Python generator can't touch the TypeScript directory and vice versa).
 
 ## How this was built
 
