@@ -15,32 +15,37 @@ fixer — do not edit any source file.
 2. Verify `clients/typescript/dist/client.js` exists. If not, build:
    `cd clients/typescript && npm install && npx tsc`. Failed build →
    return failure with the errors.
-3. Run the test:
+3. Run the conformance test against **both clients**, sequentially:
 
    ```bash
    python test/runner.py --client-cmd "python clients/python/client.py"
+   python test/runner.py --client-cmd "node clients/typescript/dist/client.js"
    ```
 
-4. Capture stdout/stderr and exit code.
+   Both must PASS for the overall verdict to be PASS. If either fails,
+   the overall verdict is FAIL.
+4. Capture stdout/stderr and exit code for each.
 5. Return the verdict.
 
 ## Return format
 
-**On PASS:**
+**On PASS (both clients):**
 
 ```
-PASS — all <N> cases succeeded.
-(last ~10 lines of runner output)
+PASS — Python: all <N> cases succeeded. TypeScript: all <N> cases succeeded.
+(last ~5 lines of each runner's output)
 ```
 
-**On FAIL:**
+**On FAIL (either client):**
 
 ```
-FAIL — <case that failed>
-Reason: <one-line diagnosis>
+FAIL — <python|typescript|both>
+Python:     <PASS or FAIL — <failing case>>
+TypeScript: <PASS or FAIL — <failing case>>
+Reason: <one-line diagnosis of the failing client(s)>
 
 Full runner output:
-<stdout/stderr verbatim>
+<stdout/stderr verbatim, both clients>
 ```
 
 ## Diagnosis hints (Iteration 1)
