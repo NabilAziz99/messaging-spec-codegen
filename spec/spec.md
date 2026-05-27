@@ -145,7 +145,7 @@ flushes).
 
 **Commands accepted in INITIAL:** `/login`, `/help`, `/quit`.
 **Commands accepted in LOGGED_IN:** `/send`, `/help`, `/quit`.
-**Commands accepted in OFFLINE:** `/send` (queues — Iter 4), `/help`, `/quit`.
+**Commands accepted in OFFLINE:** `/send` (queues), `/help`, `/quit`.
 
 OFFLINE is **transient** — the client runs a reconnect loop in the
 background and re-enters LOGGED_IN as soon as the network is back.
@@ -213,7 +213,7 @@ OFFLINE:
 3. Append one row to the outbox file (see "Outbox file" below):
    `{"id": "...", "to": "...", "text": "...", "status": "pending"}`
 4. Print `queued`. Do NOT attempt to transmit (we're offline; the
-   reconnect loop will flush this row once it succeeds — Iteration 5).
+   reconnect loop will flush this row once it succeeds).
 
 ## Outbox file
 
@@ -411,11 +411,13 @@ expected stdout. All cases must pass for the current scope to be green.
 - Action: stop the server (kill its process).
 - Expected stdout (alice): `disconnected` (printed once, on transition).
 
-### Step 3.b — /send while OFFLINE queues (Iteration 4 will add the outbox)
+### Step 3.b — /send while OFFLINE queues to outbox
 
 - Pre: alice OFFLINE (server stopped).
 - Action: `/send bob hi`
 - Expected stdout: `queued`
+- Expected side-effect: `outbox-alice.jsonl` contains one row with
+  `to=bob`, `text=hi`, `status=pending`.
 
 ### Step 3.c — server restoration auto-reconnects
 

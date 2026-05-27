@@ -60,6 +60,9 @@ class ClientHandle:
         self.cwd = cwd
         self.lines: list[str] = []
         self._reader: asyncio.Task | None = None
+        # wait_for advances this cursor past each match it returns, so
+        # repeated wait_for("queued") within one test finds each NEW
+        # occurrence rather than matching the first one over and over.
         self._wait_cursor: int = 0
 
     async def start_reader(self) -> None:
@@ -79,7 +82,11 @@ class ClientHandle:
         note(f"{self.name} ← {command}")
 
     async def wait_for(self, expected: str, timeout: float = STEP_TIMEOUT) -> str:
-        """Block until a line containing `expected` arrives."""
+        """Block until a NEW line containing `expected` arrives.
+
+        "New" means not already consumed by a previous wait_for call.
+        On match, advances the cursor past the matched line.
+        """
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
             for i in range(self._wait_cursor, len(self.lines)):
@@ -158,10 +165,10 @@ async def _wait_for_server(host: str, port: int, timeout: float) -> None:
 class ServerHandle:
     """Wraps the server subprocess; supports stop/start mid-test.
 
-    Iteration 3 introduces this so cases can simulate a network outage
-    by stopping the server and then bring it back. Tests that just
-    need "server up for the body" can use the `server_running` context
-    manager and ignore the handle.
+    Tests that just need "server up for the body" can use the
+    `server_running` context manager and ignore the handle. Tests that
+    need to simulate a network outage call `.stop()` / `.start()` on
+    the yielded handle to cycle the server while clients are running.
     """
 
     def __init__(self) -> None:
@@ -214,7 +221,16 @@ async def server_running() -> AsyncIterator[ServerHandle]:
 
 
 def _resolve_paths(argv: list[str]) -> list[str]:
-    """Resolve relative paths in argv to absolute paths from REPO_ROOT."""
+    """Resolve relative paths in argv to absolute paths from REPO_ROOT.
+
+    The harness spawns each client in a per-case temp cwd (so future
+    outbox files won't collide). A relative path like
+    'clients/python/client.py' won't resolve in the temp cwd; we
+    absolutize any argv element that is a relative path AND exists
+    as a file under REPO_ROOT. This also handles paths containing
+    spaces — subprocess.create_subprocess_exec takes argv directly,
+    bypassing shell-splitting.
+    """
     out = []
     for arg in argv:
         if not arg.startswith("-") and not Path(arg).is_absolute():

@@ -128,7 +128,8 @@ async def handle_deliver_ok(frame: dict, recipient: str) -> None:
 
 def on_disconnect(name: str | None, ws) -> None:
     """Called from server.py when a connection closes. Removes from
-    `connections` if this socket still owns the slot."""
+    `connections` if this socket still owns the slot; leaves inbox
+    intact so un-acked messages re-deliver on next login."""
     if name is not None and connections.get(name) is ws:
         del connections[name]
         logger.info("disconnect: %r", name)

@@ -37,7 +37,12 @@ EXPECTED_KEYS = {
 
 def parse_frame(raw: str) -> dict:
     """Parse + shape-validate one inbound frame. Raise ValueError with
-    a spec-pinned reason string on any violation."""
+    a SPEC-PINNED reason string on any violation.
+
+    Reason strings used (per spec §"Protocol errors"):
+      'invalid json'   — body is not parseable as JSON
+      'invalid frame'  — JSON OK but doesn't match a known frame shape
+    """
     try:
         frame = json.loads(raw)
     except json.JSONDecodeError:
