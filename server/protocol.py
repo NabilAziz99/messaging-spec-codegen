@@ -24,6 +24,9 @@ DEFAULT_PORT = 8765
 CLOSE_SUPERSEDED = 4000
 CLOSE_INVALID_FRAME = 4001
 
+# Frame size cap (Iteration 9). Bytes of the encoded UTF-8 body.
+MAX_FRAME_SIZE_BYTES = 16 * 1024
+
 # Required key set per inbound frame type (exact match — extras are rejected).
 EXPECTED_KEYS = {
     "login":      {"type", "name"},

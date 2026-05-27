@@ -5,7 +5,7 @@ in different languages, generated against this spec, must
 interoperate. Where the generated code disagrees with the spec, the
 spec wins.
 
-This spec is built iteratively. **Iterations 1-8 complete (through UUID dedup).**
+This spec is built iteratively. **Iterations 1-9 complete (through protocol error handling).**
 
 ---
 
@@ -283,6 +283,64 @@ state change. No interactive prompt characters.
 | `/send <invalid-recipient> <text>` | `error: usage: /send <recipient> <text>` |
 | `/send` while INITIAL | `error: not logged in; use /login <name> first` |
 
+## Concurrency and ordering
+
+**Runtime model.** Both server and client are **single-threaded event
+loops** (Python `asyncio`; Node async/await). One event at a time: a
+CLI command, an inbound frame, or a file I/O. No worker threads.
+
+**Per-sender FIFO at the server.** If alice sends `m1` then `m2` to
+bob, the server enqueues them into `inbox[bob]` in that order and
+pushes them to bob (online or on next login) in that order.
+
+**Per-sender FIFO at the client outbox.** Rows are appended in the
+order of `/send` commands. Outbox flush replays them in file order,
+serially (one `send_ok` await before the next frame).
+
+**Cross-sender ordering.** No guarantee. If alice and carol both send
+to offline bob, bob may receive them in either order on next login.
+
+**Outbound flush vs inbound push (the reconnect interleave).** On
+reconnect, the client's outbox flush and the server's inbox push run
+on the same WebSocket. Frames interleave in arrival order — no causal
+relationship between alice's outgoing `send` frames and the `deliver`
+frames the server pushes to her. The conformance test exercises this
+in Step 7 (see below).
+
+**login_ok ordering.** The server sends `login_ok` strictly before
+any `deliver` frame in the same session. This is the only ordering
+rule the protocol guarantees about session start.
+
+## Protocol errors
+
+**Frame size cap.** Inbound frames larger than **16 KiB (16384 bytes)**
+are rejected. Server closes the connection with code **4001**, reason
+`oversize frame`.
+
+**Server-side strictness.** The server validates each inbound frame.
+On any violation it closes the connection with WebSocket close code
+**4001** and one of the following exact reason strings:
+
+| Violation | Close reason |
+|---|---|
+| Frame body is not valid JSON | `invalid json` |
+| Valid JSON but not a top-level object | `invalid frame` |
+| Missing or non-string `type` field | `invalid frame` |
+| Unknown `type` value | `invalid frame` |
+| Wrong key set for the frame type (missing or extra keys) | `invalid frame` |
+| Frame size exceeds 16 KiB | `oversize frame` |
+| `send` from a connection that hasn't `login`'d yet | `send: not logged in` |
+| Second `login` on a connection already logged in | `already logged in on this connection` |
+
+The reason strings are deterministic and conformance-test-checkable.
+
+**Client-side strictness.** Clients SHOULD parse inbound frames
+defensively; malformed frames from the server are a protocol error
+and the client SHOULD close the connection. For v1 the clients
+tolerate malformed inbound by dropping the frame silently (the
+reference server never sends malformed frames). Tightening this is
+deferred — see FUTURE.md.
+
 ## Conformance scenario
 
 The conformance test harness drives each case below and asserts the
@@ -500,3 +558,25 @@ Expected end state:
   alone — the second is treated as a duplicate.
 - Expected: bob receives "first". Carol receives nothing (the second
   frame is dropped entirely). Both sends get `send_ok`.
+
+### Step 9.a — malformed JSON closes with `invalid json`
+
+- Action: send raw text `"{not json"` (or any non-parseable body) to
+  the server over an open WebSocket.
+- Expected: server closes connection. WS close code 4001, reason
+  `invalid json`.
+
+### Step 9.b — unknown frame type closes with `invalid frame`
+
+- Action: send `{"type": "nope", "name": "alice"}`.
+- Expected: WS close code 4001, reason `invalid frame`.
+
+### Step 9.c — extra fields closes with `invalid frame`
+
+- Action: send `{"type": "login", "name": "alice", "extra": "field"}`.
+- Expected: WS close code 4001, reason `invalid frame`.
+
+### Step 9.d — oversize frame closes with `oversize frame`
+
+- Action: send a frame whose UTF-8 body exceeds 16 KiB.
+- Expected: WS close code 4001, reason `oversize frame`.

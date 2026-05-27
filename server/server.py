@@ -26,6 +26,7 @@ from protocol import (  # noqa: E402
     CLOSE_INVALID_FRAME,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_FRAME_SIZE_BYTES,
     WS_PATH,
     parse_frame,
 )
@@ -56,6 +57,10 @@ async def connection_handler(ws) -> None:
     try:
         async for raw in ws:
             try:
+                # Iteration 9: frame size cap (16 KiB). Reject before parsing.
+                raw_bytes = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+                if len(raw_bytes) > MAX_FRAME_SIZE_BYTES:
+                    raise ValueError("oversize frame")
                 frame = parse_frame(raw)
                 frame_type = frame["type"]
                 if frame_type == "login":
